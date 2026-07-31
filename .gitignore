@@ -1,5 +1,6 @@
 /build
 /dist
 *.exe
+!cloudflared.exe
 *.json
 *.spec

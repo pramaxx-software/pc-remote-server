@@ -1,0 +1,7 @@
+pyinstaller 
+customtkinter 
+websockets 
+pynput 
+pystray 
+pillow 
+qrcode

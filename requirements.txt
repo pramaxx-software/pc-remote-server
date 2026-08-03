@@ -5,3 +5,6 @@ pynput
 pystray 
 pillow 
 qrcode
+PyTurboJPEG
+numpy
+mss

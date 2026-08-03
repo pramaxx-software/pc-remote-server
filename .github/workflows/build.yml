@@ -34,13 +34,9 @@ jobs:
           $VERSION = "v1.0.$($env:GITHUB_RUN_NUMBER)"
           echo "tag=$VERSION" >> $env:GITHUB_OUTPUT
 
-      - name: Build Server EXE with PyInstaller
-        run: |
-          python -m PyInstaller --noconsole --onefile --icon="icon.ico" --name "pramaxx-server" --add-binary "cloudflared.exe;." server.py
-
       - name: Build Newv1 EXE with PyInstaller
         run: |
-          python -m PyInstaller --noconsole --onefile --icon="icon.ico" --name "pramaxx-newv1" --add-binary "cloudflared.exe;." newv1.py
+          python -m PyInstaller --noconsole --onefile --icon="icon.ico" --name "pramaxx-remote-server" --add-binary "cloudflared.exe;." --version-file "version_info.txt" newv1.py
 
 
       - name: Create GitHub Release & Upload Files
@@ -52,7 +48,6 @@ jobs:
             ### Pramaxx Remote Server & Exe (${{ steps.version.outputs.tag }})
             - **EXE Files**: Auto-generated dari GitHub Actions (Windows Environment dengan semua dependensi lengkap).
           files: |
-            dist/pramaxx-server.exe
-            dist/pramaxx-newv1.exe
+            dist/pramaxx-remote-server.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

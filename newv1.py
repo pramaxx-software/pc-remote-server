@@ -1,11 +1,11 @@
 import qrcode
 import asyncio
-import base64
 import io
 import json
 import os
 import re
 import socket
+import struct
 import sys
 import threading
 import time
@@ -13,54 +13,60 @@ import subprocess
 import urllib.request
 import urllib.error
 import uuid
+import xml.etree.ElementTree as ET
+from pathlib import Path
 import customtkinter as ctk
 import websockets
+import mss
 from pynput.keyboard import Controller as KeyboardController, Key
 from pynput.mouse import Controller as MouseController, Button
 import pystray
-from PIL import Image, ImageDraw, ImageGrab
+from PIL import Image, ImageDraw
 import ctypes
 
-# Set tema tampilan Modern
+try:
+    from turbojpeg import TurboJPEG
+    import numpy as np
+    _tj = TurboJPEG()
+    HAS_TURBOJPEG = True
+except Exception:
+    _tj = None
+    HAS_TURBOJPEG = False
+
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.4"
 
 
 def get_config_path():
-    # Ambil direktori AppData\Roaming milik user Windows saat ini
     appdata_dir = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), "PramaxxRemoteKeyboardServer")
-
-    # Buat foldernya secara otomatis kalau belum ada
     if not os.path.exists(appdata_dir):
         os.makedirs(appdata_dir, exist_ok=True)
-
     return os.path.join(appdata_dir, "config.json")
 
 
-# --- KONFIGURASI API & FILE ---
 CONFIG_FILE = get_config_path()
 CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
 
-# Endpoint API Web Panel yang relevan saja (Validasi Token & Sync Settings)
 WEB_PANEL_BASE_URL = "https://pc-remote.pramaxx.biz.id/api"
 WEB_PANEL_API_URL = f"{WEB_PANEL_BASE_URL}/validate_token"
 WEB_PANEL_SYNC_URL = f"{WEB_PANEL_BASE_URL}/sync_settings"
+WEB_PANEL_SYNC_SHORTCUT_RESOLUME = f"{WEB_PANEL_BASE_URL}/sync_resolume_shortcut"
 
 DEFAULT_CONFIG = {
-    "device_id": "",   # Digenerate otomatis saat pertama run
+    "device_id": "",
     "port": 8765,
     "mode": "Lokal (LAN)",
-    "web_token": "",   # Token hash yang diinput user (device -> cloudflare)
-    "cf_token": "",    # Token asli Cloudflare hasil dari backend
+    "web_token": "",
+    "cf_token": "",
     "security_pin": "",
     "auto_minimize": False,
-    # Fitur remote
     "allow_mouse": True,
     "allow_stream": True,
-    "stream_fps": 15,
-    "stream_quality": 50,
+    "stream_fps": 60,
+    "stream_quality": 100,
+    "resolume_shortcuts": []
 }
 
 
@@ -87,7 +93,6 @@ def save_config(config_data):
 
 
 def api_post(url, payload, headers=None, timeout=10):
-    """Helper kecil untuk POST JSON ke web panel dan mengembalikan dict hasil parse."""
     body = json.dumps(payload).encode("utf-8")
     req_headers = {"Content-Type": "application/json", "User-Agent": "PramaxxRemoteKeyboardClient/1.0"}
     if headers:
@@ -98,7 +103,18 @@ def api_post(url, payload, headers=None, timeout=10):
     return json.loads(raw) if raw else {}
 
 
-# --- 1. SETUP KEYBOARD & MOUSE CONTROLLER ---
+def encode_jpeg(pil_img, quality):
+    if HAS_TURBOJPEG:
+        try:
+            arr = np.array(pil_img)
+            return _tj.encode(arr, quality=quality)
+        except Exception:
+            pass
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
 keyboard = KeyboardController()
 mouse = MouseController()
 
@@ -145,7 +161,105 @@ def get_cloudflared_path():
     return None
 
 
-# --- 2. KELAS UTAMA APLIKASI ---
+SPECIAL_KEYS_FORMAT = {
+    32: "Space",
+    13: "Enter",
+    27: "Esc",
+    9: "Tab",
+    8: "Backspace",
+    127: "Delete",
+    
+    # Tombol Panah (Arrow Keys)
+    65550: "Left Arrow",
+    65551: "Right Arrow",
+    65552: "Up Arrow",
+    65553: "Down Arrow",
+}
+
+# 2. Tambahkan F1 hingga F12 secara otomatis (JUCE KeyCodes: 65537 - 65548)
+for i in range(1, 13):
+    # F1 = 65537, F2 = 65538, ..., F12 = 65548
+    juce_f_key_code = 0x10000 + i  
+    SPECIAL_KEYS_FORMAT[juce_f_key_code] = f"F{i}"
+
+
+def parse_raw_key(raw_key_str):
+    """Menerjemahkan ID key RawInputMessage menjadi string tombol atau None."""
+    if not raw_key_str or raw_key_str == "0":
+        return None
+
+    try:
+        val = int(raw_key_str)
+        ascii_code = val >> 32
+        
+        if ascii_code <= 0:
+            return None
+
+        # Cek apakah ada di daftar tombol khusus (F1-F12, Space, Enter, Arrow, dll)
+        if ascii_code in SPECIAL_KEYS_FORMAT:
+            return SPECIAL_KEYS_FORMAT[ascii_code]
+        
+        # Karakter ASCII printable standar (A-Z, 0-9, simbol)
+        if 33 <= ascii_code <= 126:
+            return chr(ascii_code)
+            
+        return None
+    except Exception:
+        return None
+
+
+def scan_resolume_shortcuts():
+    """Memindai file XML shortcut Resolume (dijamin 100% bebas dari null)."""
+    shortcuts_data = []
+    try:
+        shortcut_path = Path.home() / "Documents" / "Resolume Arena" / "Shortcuts" / "Keyboard"
+        if not shortcut_path.exists():
+            return []
+
+        for file_item in shortcut_path.rglob("*.xml"):
+            if file_item.is_file():
+                try:
+                    tree = ET.parse(file_item)
+                    root = tree.getroot()
+
+                    mappings = []
+                    shortcut_manager = root.find("ShortcutManager")
+                    
+                    if shortcut_manager is not None:
+                        for shortcut_elem in shortcut_manager.findall("Shortcut"):
+                            path_elem = shortcut_elem.find("ShortcutPath")
+                            raw_msg_elem = shortcut_elem.find("RawInputMessage")
+                            
+                            if path_elem is None or raw_msg_elem is None:
+                                continue
+
+                            path_val = path_elem.attrib.get("path", "")
+                            raw_key = raw_msg_elem.attrib.get("key", "")
+                            
+                            if not path_val:
+                                continue
+
+                            key_char = parse_raw_key(raw_key)
+
+                            # STRICT FILTER: Hanya append jika key_char valid (bukan None & bukan "")
+                            if key_char:
+                                mappings.append(key_char)
+
+                    # DOUBLE SAFETY: Sapu bersih jika masih ada None/null yang tersisa
+                    clean_mappings = [m for m in mappings if m is not None and m != ""]
+
+                    if clean_mappings:
+                        shortcuts_data.extend(clean_mappings)
+                        
+                except Exception as ex:
+                    print(f"Gagal memparsing file XML {file_item.name}: {ex}")
+
+        return shortcuts_data
+    except Exception as e:
+        print(f"Gagal memindai folder shortcut Resolume: {e}")
+        return []
+
+
 class ModernRemoteServerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -155,7 +269,10 @@ class ModernRemoteServerApp(ctk.CTk):
         self.port = int(self.config_data.get("port", 8765))
         self.local_ip = get_local_ip()
 
-        # Status kontrol & monitoring
+        scanned_shortcuts = scan_resolume_shortcuts()
+        self.config_data["resolume_shortcuts"] = scanned_shortcuts
+        save_config(self.config_data)
+
         self.is_running = True
         self.active_clients = 0
         self.streaming_clients = 0
@@ -172,16 +289,15 @@ class ModernRemoteServerApp(ctk.CTk):
         self.setup_ui()
         self.setup_tray()
 
-        # Jalankan server WebSocket & Cloudflare
         self.start_server_thread()
         self.check_and_init_cloudflare()
+
+        if self.config_data.get("web_token"):
+            threading.Thread(target=self._sync_resolume_worker, args=(scanned_shortcuts,), daemon=True).start()
 
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.bind("<Unmap>", self.on_minimize)
 
-    # ---------------------------------------------------------------
-    # UI SETUP
-    # ---------------------------------------------------------------
     def setup_ui(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=15, pady=(15, 5))
@@ -233,7 +349,6 @@ class ModernRemoteServerApp(ctk.CTk):
         )
         self.cf_status_label.pack(pady=(2, 8))
 
-        # Ringkasan fitur remote aktif
         feature_frame = ctk.CTkFrame(self.tab_status, fg_color="#232323", corner_radius=8)
         feature_frame.pack(fill="x", padx=10, pady=(6, 8))
 
@@ -278,7 +393,6 @@ class ModernRemoteServerApp(ctk.CTk):
             text_color="#10b981" if allow_stream else "#6b7280"
         )
 
-    # --- FITUR QR CODE ---
     def show_qr_code(self):
         mode = self.config_data.get("mode", "Lokal (LAN)")
 
@@ -291,12 +405,15 @@ class ModernRemoteServerApp(ctk.CTk):
         port = self.port
         pin = self.config_data.get("security_pin", "")
 
+        # QR code hanya membawa parameter esensial agar tidak terjadi error Invalid Version
         qr_payload = json.dumps({
             "ip": ip_domain,
             "port": str(port),
             "pin": pin,
             "mouse": self.config_data.get("allow_mouse", True),
             "stream": self.config_data.get("allow_stream", True),
+            "device_id": self.config_data.get('device_id'),
+            "resolume_shortcuts": self.config_data.get('resolume_shortcuts'),
         })
 
         try:
@@ -323,9 +440,6 @@ class ModernRemoteServerApp(ctk.CTk):
         except Exception as e:
             print(f"Gagal memuat QR Code: {e}")
 
-    # ---------------------------------------------------------------
-    # TAB PENGATURAN
-    # ---------------------------------------------------------------
     def setup_settings_tab(self):
         ctk.CTkLabel(self.tab_settings, text="Mode Koneksi:", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(8, 0))
         self.mode_option = ctk.CTkOptionMenu(
@@ -372,7 +486,6 @@ class ModernRemoteServerApp(ctk.CTk):
         )
         self.copy_btn.pack(side="right")
 
-        # --- Toggle fitur remote ---
         ctk.CTkLabel(self.tab_settings, text="Fitur Remote:", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(4, 2))
 
         self.mouse_switch = ctk.CTkSwitch(
@@ -407,7 +520,6 @@ class ModernRemoteServerApp(ctk.CTk):
         save_config(self.config_data)
         self.refresh_feature_labels()
 
-    # --- AKSI VALIDASI TOKEN & SIMPAN ---
     def on_submit_token(self):
         web_token = self.token_entry.get().strip()
         if not web_token:
@@ -449,6 +561,11 @@ class ModernRemoteServerApp(ctk.CTk):
 
                 self.update_cf_status("● Pramaxx Tunnel: Token valid! Mengaktifkan tunnel...", "#10b981")
 
+                scanned = scan_resolume_shortcuts()
+                self.config_data["resolume_shortcuts"] = scanned
+                save_config(self.config_data)
+                threading.Thread(target=self._sync_resolume_worker, args=(scanned,), daemon=True).start()
+
                 if self.mode_option.get() == "Online (Cloudflare Tunnel)":
                     self.check_and_init_cloudflare()
             else:
@@ -462,6 +579,20 @@ class ModernRemoteServerApp(ctk.CTk):
             self.update_cf_status("● Pramaxx Tunnel: Gagal terhubung ke server validasi!", "#ef4444")
             self.after(0, lambda: self.submit_token_btn.configure(text="✕ Offline/Error", fg_color="#ef4444", state="normal"))
             self.after(2500, lambda: self.submit_token_btn.configure(text="Submit Token", fg_color="#3b82f6"))
+
+    def _sync_resolume_worker(self, shortcuts_data):
+        web_token = self.config_data.get("web_token", "").strip()
+        if not web_token:
+            return
+        try:
+            api_post(WEB_PANEL_SYNC_SHORTCUT_RESOLUME, {
+                "device_id": self.device_id,
+                "web_token": web_token,
+                "shortcuts": shortcuts_data
+            }, timeout=7)
+            print("Berhasil menyinkronkan data ringkas shortcut Resolume ke Web Panel.")
+        except Exception as e:
+            print(f"Gagal sinkronisasi shortcut Resolume ke web panel: {e}")
 
     def on_copy_pin(self):
         pin_text = self.pin_label.cget("text")
@@ -484,6 +615,8 @@ class ModernRemoteServerApp(ctk.CTk):
         except ValueError:
             new_port = 8765
 
+        scanned_shortcuts = scan_resolume_shortcuts()
+
         new_config = dict(self.config_data)
         new_config.update({
             "device_id": self.device_id,
@@ -495,6 +628,7 @@ class ModernRemoteServerApp(ctk.CTk):
             "auto_minimize": False,
             "allow_mouse": bool(self.mouse_switch.get()),
             "allow_stream": bool(self.stream_switch.get()),
+            "resolume_shortcuts": scanned_shortcuts
         })
 
         save_config(new_config)
@@ -506,6 +640,7 @@ class ModernRemoteServerApp(ctk.CTk):
 
         self.save_btn.configure(text="Syncing to Web Panel...", fg_color="#f59e0b", state="disabled")
         threading.Thread(target=self._sync_settings_worker, args=(new_config,), daemon=True).start()
+        threading.Thread(target=self._sync_resolume_worker, args=(scanned_shortcuts,), daemon=True).start()
 
     def _sync_settings_worker(self, config_data):
         try:
@@ -529,7 +664,6 @@ class ModernRemoteServerApp(ctk.CTk):
         finally:
             self.after(3000, lambda: self.save_btn.configure(text="Simpan & Terapkan Semua", fg_color="#10b981", state="normal"))
 
-    # --- CLOUDFLARED TUNNEL MANAGEMENT ---
     def check_and_init_cloudflare(self):
         mode = self.config_data.get("mode")
         if mode == "Online (Cloudflare Tunnel)":
@@ -545,7 +679,7 @@ class ModernRemoteServerApp(ctk.CTk):
     def prompt_download_cloudflared(self):
         self.update_cf_status("● Pramaxx Tunnel: Belum terinstall!", "#ef4444")
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Install Cloudflared")
+        dialog.title("Install Tunnel")
         dialog.geometry("320x180")
         dialog.attributes("-topmost", True)
         dialog.resizable(False, False)
@@ -607,7 +741,6 @@ class ModernRemoteServerApp(ctk.CTk):
     def on_mode_change(self, choice):
         self.mode_label.configure(text=f"Mode: {choice}")
 
-    # --- SYSTEM TRAY MANAGEMENT ---
     def create_tray_image(self):
         image = Image.new('RGB', (64, 64), color=(18, 18, 18))
         dc = ImageDraw.Draw(image)
@@ -632,10 +765,16 @@ class ModernRemoteServerApp(ctk.CTk):
         if self.state() == 'iconic':
             self.hide_to_tray()
 
-    # --- WEBSOCKET SERVER LOGIC (KEYBOARD + MOUSE + STREAM) ---
     async def websocket_handler(self, websocket):
         client_ip = websocket.remote_address[0]
         print(f"[{client_ip}] Terhubung!")
+
+        try:
+            sock = websocket.transport.get_extra_info('socket')
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception as e:
+            print(f"TCP_NODELAY tidak bisa diset: {e}")
 
         self.active_clients += 1
         self.update_status(f"● LAN: Terhubung ({client_ip}) - {self.active_clients} Client", "#10b981")
@@ -644,6 +783,9 @@ class ModernRemoteServerApp(ctk.CTk):
 
         try:
             async for message in websocket:
+                if isinstance(message, (bytes, bytearray)):
+                    continue
+
                 try:
                     data = json.loads(message)
                 except (json.JSONDecodeError, TypeError):
@@ -659,7 +801,6 @@ class ModernRemoteServerApp(ctk.CTk):
                 if cmd_type in ("press", "shortcut"):
                     self.process_keyboard_command(data)
 
-                # --- PERBAIKAN: "mouse_position_percent" DITAMBAHKAN KE LIST DI BAWAH INI ---
                 elif cmd_type in ("mouse_move", "mouse_click", "mouse_scroll", "mouse_position", "mouse_position_percent"):
                     self.process_mouse_command(data)
 
@@ -714,32 +855,24 @@ class ModernRemoteServerApp(ctk.CTk):
         try:
             cmd_type = data.get("type")
 
-            # --- KONTROL ABSOLUT (SINKRON DENGAN JARI/KURSOR CLIENT) ---
             if cmd_type == "mouse_position_percent":
                 percent_x = float(data.get("percentX", 0))
                 percent_y = float(data.get("percentY", 0))
-                
-                # Ambil resolusi asli layar PC pake ctypes (Windows Only)
+
                 user32 = ctypes.windll.user32
                 screen_width = user32.GetSystemMetrics(0)
                 screen_height = user32.GetSystemMetrics(1)
-                
-                # Konversi persentase ke posisi pixel di PC
+
                 target_x = int(screen_width * percent_x)
                 target_y = int(screen_height * percent_y)
-                
-                # Pindahkan kursor PC (Pynput)
-                mouse.position = (target_x, target_y)
-                print(f"Posisi Absolut: X={target_x}, Y={target_y}")
 
-            # --- KONTROL RELATIF (UNTUK TRACKPAD BIASA) ---
+                mouse.position = (target_x, target_y)
+
             elif cmd_type == "mouse_move":
                 dx = float(data.get("dx", 0))
                 dy = float(data.get("dy", 0))
                 mouse.move(dx, dy)
-                print(f"Posisi Relatif (Move): DX={dx}, DY={dy}")
 
-            # --- KONTROL KLIK MOUSE ---
             elif cmd_type == "mouse_click":
                 btn_name = data.get("button", "left")
                 button_obj = MOUSE_BUTTONS.get(btn_name, Button.left)
@@ -751,7 +884,6 @@ class ModernRemoteServerApp(ctk.CTk):
                 else:
                     mouse.click(button_obj, 2 if double else 1)
 
-            # --- KONTROL SCROLL ---
             elif cmd_type == "mouse_scroll":
                 dx = int(data.get("dx", 0))
                 dy = int(data.get("dy", 0))
@@ -761,95 +893,92 @@ class ModernRemoteServerApp(ctk.CTk):
             print(f"Error memproses perintah mouse: {e}")
 
     async def stream_screen(self, websocket, session):
+        loop = asyncio.get_event_loop()
         is_cf = self.config_data.get("mode") == "Online (Cloudflare Tunnel)"
-        
-        default_fps = 10 if is_cf else 15
-        default_qual = 30 if is_cf else 50
-        
+
+        default_fps = 15 if is_cf else 30
+        default_qual = 35 if is_cf else 65
         fps = max(1, int(self.config_data.get("stream_fps", default_fps)))
         quality = max(10, min(95, int(self.config_data.get("stream_quality", default_qual))))
-        delay = 1.0 / fps
+        capture_delay = 1.0 / fps
+        target_size = (640, 360) if is_cf else (1280, 720)
+
+        frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        stop_event = asyncio.Event()
+
+        sct = mss.mss()
+        monitor = sct.monitors[1]
+
+        def capture_and_encode():
+            try:
+                raw = sct.grab(monitor)
+                pil_img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                pil_img.thumbnail(target_size)
+
+                mx, my = mouse.position
+                scale_x = pil_img.width / monitor["width"]
+                scale_y = pil_img.height / monitor["height"]
+                cx, cy = int(mx * scale_x), int(my * scale_y)
+                draw = ImageDraw.Draw(pil_img)
+                pointer_points = [
+                    (cx, cy), (cx, cy + 12), (cx + 4, cy + 9),
+                    (cx + 9, cy + 14), (cx + 11, cy + 11),
+                    (cx + 6, cy + 6), (cx + 10, cy + 6)
+                ]
+                draw.polygon(pointer_points, fill="white", outline="black")
+
+                jpeg_bytes = encode_jpeg(pil_img, quality)
+                header = struct.pack("!BHH", 1, pil_img.width, pil_img.height)
+                return header + jpeg_bytes
+            except Exception as e:
+                print(f"Capture error: {e}")
+                return None
+
+        async def producer():
+            try:
+                while not stop_event.is_set():
+                    t0 = time.time()
+                    frame = await loop.run_in_executor(None, capture_and_encode)
+                    if frame is not None:
+                        if frame_queue.full():
+                            try:
+                                frame_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                        await frame_queue.put(frame)
+                    elapsed = time.time() - t0
+                    await asyncio.sleep(max(0.0, capture_delay - elapsed))
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Producer error: {e}")
+
+        async def consumer():
+            try:
+                while not stop_event.is_set():
+                    frame = await frame_queue.get()
+                    await websocket.send(frame)
+            except asyncio.CancelledError:
+                pass
+            except websockets.exceptions.ConnectionClosed:
+                print("Stream terhenti: Client terputus.")
+            except Exception as e:
+                print(f"Consumer error: {e}")
+
+        producer_task = asyncio.ensure_future(producer())
+        consumer_task = asyncio.ensure_future(consumer())
 
         try:
             while session["streaming"] and self.config_data.get("allow_stream", True):
-                start = time.time()
-                try:
-                    # 1. Ambil posisi kursor asli dari pynput
-                    mx, my = mouse.position
-
-                    # 2. Tangkap layar (tanpa include_cursor karena sering gagal di Windows)
-                    img = ImageGrab.grab()
-                    
-                    if img is None:
-                        await websocket.send(json.dumps({
-                            "type": "stream_error", 
-                            "message": "Gagal menangkap layar. Pastikan PC tidak terkunci/Sleep!"
-                        }))
-                        break
-
-                    orig_w, orig_h = img.size
-
-                    # 3. Resize gambar ke thumbnail (mengikuti ukuran stream)
-                    target_size = (640, 360) if is_cf else (960, 540)
-                    img.thumbnail(target_size)
-                    thumb_w, thumb_h = img.size
-
-                    # 4. Sesuaikan posisi kursor agar pas dengan ukuran thumbnail yang sudah di-resize
-                    scale_x = thumb_w / orig_w
-                    scale_y = thumb_h / orig_h
-                    cursor_x = int(mx * scale_x)
-                    cursor_y = int(my * scale_y)
-
-                    # 5. Gambar bentuk pointer kursor secara manual di atas gambar
-                    draw = ImageDraw.Draw(img)
-                    pointer_points = [
-                        (cursor_x, cursor_y),
-                        (cursor_x, cursor_y + 12),
-                        (cursor_x + 4, cursor_y + 9),
-                        (cursor_x + 9, cursor_y + 14),
-                        (cursor_x + 11, cursor_y + 11),
-                        (cursor_x + 6, cursor_y + 6),
-                        (cursor_x + 10, cursor_y + 6)
-                    ]
-                    # Gambar kursor warna putih dengan garis pinggir hitam agar terlihat jelas di background apa pun
-                    draw.polygon(pointer_points, fill="white", outline="black")
-
-                    # 6. Konversi ke JPEG dan kirim ke client via WebSocket
-                    buf = io.BytesIO()
-                    img.convert("RGB").save(buf, format="JPEG", quality=quality)
-                    b64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-                    await websocket.send(json.dumps({
-                        "type": "frame",
-                        "width": img.width,
-                        "height": img.height,
-                        "data": b64_data
-                    }))
-                    
-                except websockets.exceptions.ConnectionClosed:
-                    print("Stream terhenti: Client terputus.")
-                    break
-                except Exception as e:
-                    print(f"Stream error: {e}")
-                    try:
-                        await websocket.send(json.dumps({
-                            "type": "stream_error", 
-                            "message": f"Server Error: {str(e)}"
-                        }))
-                    except: 
-                        pass
-                    break
-
-                elapsed = time.time() - start
-                await asyncio.sleep(max(0.0, delay - elapsed))
-                
-        except asyncio.CancelledError:
-            pass
+                await asyncio.sleep(0.2)
         finally:
+            stop_event.set()
+            producer_task.cancel()
+            consumer_task.cancel()
+            await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
+            sct.close()
             session["streaming"] = False
-            
 
-    # --- THREADING & ASYNCIO MANAGEMENT ---
     async def _run_server_async(self):
         try:
             async with websockets.serve(self.websocket_handler, "0.0.0.0", self.port, max_size=None):
@@ -884,7 +1013,6 @@ class ModernRemoteServerApp(ctk.CTk):
         self.after(0, self.destroy)
 
 
-# --- JALANKAN APLIKASI ---
 if __name__ == "__main__":
     app = ModernRemoteServerApp()
     app.mainloop()

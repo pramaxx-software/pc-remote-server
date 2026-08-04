@@ -791,13 +791,37 @@ class ModernRemoteServerApp(ctk.CTk):
                 except (json.JSONDecodeError, TypeError):
                     continue
 
+                cmd_type = data.get("type")
+
+                # ==============================================================
+                # 1. PERINTAH DENGAN AKSES ANONYMOUS / SEBELUM CEK PIN
+                # ==============================================================
+                if cmd_type == "get_shortcuts":
+                    # Selalu pindai ulang shortcut terbaru dari file XML Resolume
+                    scanned = scan_resolume_shortcuts()
+                    self.config_data["resolume_shortcuts"] = scanned
+                    save_config(self.config_data)
+
+                    # Kirim balik payload ke Android App
+                    response = {
+                        "type": "sync_shortcuts",
+                        "resolume_shortcuts": scanned
+                    }
+                    await websocket.send(json.dumps(response))
+                    print(f"[{client_ip}] Berhasil mengirim {len(scanned)} shortcut Resolume ke client.")
+                    continue
+
+                # ==============================================================
+                # 2. VALIDASI PIN KEAMANAN UNTUK PERINTAH EXECUTE (KEYBOARD/MOUSE)
+                # ==============================================================
                 server_pin = self.config_data.get("security_pin", "")
                 if server_pin and data.get("pin") != server_pin:
                     print("PIN Keamanan Salah! Perintah ditolak.")
                     continue
 
-                cmd_type = data.get("type")
-
+                # ==============================================================
+                # 3. PERINTAH EXECUTE DENGAN PIN VALID
+                # ==============================================================
                 if cmd_type in ("press", "shortcut"):
                     self.process_keyboard_command(data)
 
